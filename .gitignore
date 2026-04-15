@@ -1,0 +1,12 @@
+.venv/
+.venv.backup.*/
+__pycache__/
+*.pyc
+
+outputs/
+
+models/*
+!models/Nucleus-Image-FP8/
+models/Nucleus-Image-FP8/*
+!models/Nucleus-Image-FP8/config.json
+!models/Nucleus-Image-FP8/moe_fp8_patch.py

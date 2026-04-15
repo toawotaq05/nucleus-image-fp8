@@ -1,0 +1,8 @@
+git+https://github.com/huggingface/diffusers.git
+accelerate>=1.13.0
+transformers>=4.57.0
+huggingface_hub>=0.34.0
+safetensors>=0.6.2
+sentencepiece>=0.2.0
+Pillow>=11.3.0
+protobuf>=6.0.0
