@@ -3,15 +3,6 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-if [ $# -lt 1 ]; then
-  echo "Usage: ./generate_image.sh \"your prompt\" [extra generate.py args]" >&2
-  echo "Example: ./generate_image.sh \"A cinematic portrait of an astronaut in snowfall\"" >&2
-  exit 1
-fi
-
-PROMPT="$1"
-shift
-
 source "$ROOT_DIR/.venv/bin/activate"
 
 EXTRA_ARGS=("$@")
@@ -36,8 +27,6 @@ fi
 
 DEFAULT_ARGS=(--local-files-only)
 
-# Keep more headroom on cuda:0 for the rest of the pipeline and push later
-# transformer blocks onto cuda:1 on dual 16 GB cards.
 if [ "${GPU_COUNT:-0}" -ge 2 ]; then
   if ! has_flag --max-gpu0 "${EXTRA_ARGS[@]}"; then
     DEFAULT_ARGS+=(--max-gpu0 10GiB)
@@ -47,7 +36,6 @@ if [ "${GPU_COUNT:-0}" -ge 2 ]; then
   fi
 fi
 
-python "$ROOT_DIR/generate.py" \
+python "$ROOT_DIR/interactive_generate.py" \
   "${DEFAULT_ARGS[@]}" \
-  --prompt "$PROMPT" \
   "${EXTRA_ARGS[@]}"

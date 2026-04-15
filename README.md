@@ -12,6 +12,7 @@ This repo is set up for a transformer-only FP8 finetune:
 - `download_model.sh`: optional helper to download the transformer-only FP8 repo locally
 - `generate.py`: load the local FP8 transformer, inject it into the base pipeline, and run inference
 - `generate_image.sh`: shortest wrapper for everyday image generation
+- `interactive_generate.sh`: keep the model loaded and generate many prompts in one session
 
 ## Quick start
 ```bash
@@ -27,6 +28,17 @@ Simplest form:
 ./generate_image.sh "A cinematic portrait of an astronaut in snowfall"
 ```
 
+Interactive form:
+```bash
+./interactive_generate.sh
+```
+
+On a two-GPU machine, the wrapper now automatically prefers a more balanced split by default:
+- `--max-gpu0 10GiB`
+- `--max-gpu1 15GiB`
+
+That keeps more headroom on `cuda:0` for the rest of the pipeline and pushes more transformer blocks onto `cuda:1`.
+
 Pick a custom basename:
 ```bash
 ./generate_image.sh "A cinematic portrait of an astronaut in snowfall" --name astronaut
@@ -38,6 +50,38 @@ Override size or steps:
   --height 1024 \
   --width 1024 \
   --steps 20
+```
+
+Generate several variations from one loaded model and one prompt-encoding pass:
+```bash
+./generate_image.sh "White Owl in Prague" \
+  --count 4
+```
+
+That reuses the already-loaded pipeline and prompt embeddings, then runs seeds `42`, `43`, `44`, and `45`.
+
+If you want a fresh random set each time:
+```bash
+./generate_image.sh "White Owl in Prague" \
+  --count 4 \
+  --randomize-seeds
+```
+
+If you want to keep the model hot in memory and iterate on prompts:
+```bash
+./interactive_generate.sh --count 4 --randomize-seeds
+```
+
+Inside interactive mode:
+```text
+prompt> White Owl in Prague at dawn
+prompt> /set steps 20
+prompt> /set count 6
+prompt> /random on
+prompt> White Owl in Prague in snowfall
+prompt> /negative blurry, low quality
+prompt> White Owl in Prague, cinematic lighting
+prompt> /quit
 ```
 
 If you prefer calling Python directly, only `--prompt` is required now:
@@ -52,10 +96,14 @@ The runner uses a conservative default layout:
 - prompt embeddings generated on `cpu`
 - VAE decode placed on the pipeline execution device
 
-Default transformer memory budgets:
+Base `generate.py` defaults:
 - `cuda:0`: `14GiB`
 - `cuda:1`: `15GiB`
 - `cpu`: `28GiB`
+
+The `generate_image.sh` wrapper overrides this on two-GPU machines to prefer:
+- `cuda:0`: `10GiB`
+- `cuda:1`: `15GiB`
 
 ## Example two-GPU run
 ```bash
@@ -73,6 +121,15 @@ If you want to try using GPU 1 for prompt encoding too:
   --text-encoder-device cuda:1 \
   --name robot-gpu-text
 ```
+
+This can speed up prompt encoding, but it is not the default because the Qwen3-VL text encoder is large and can compete with the transformer for VRAM on `cuda:1`.
+
+## Performance notes
+- CPU is only used for prompt embedding generation by default. The denoising pass still runs on the GPUs.
+- Full single-GPU placement of the transformer on one 16 GB card is not currently viable in this setup. A direct `--transformer-device-map none` test failed during transformer placement on `cuda:0`.
+- If you want the fastest stable setup on these two 16 GB cards, keep prompt encoding on CPU and let the transformer stay split across both GPUs.
+- `--count N` avoids paying the model load and prompt-encoding cost N times. Only the denoising pass repeats for each image.
+- `./interactive_generate.sh` goes one step further and avoids reloads across multiple prompts too. The model loads once per session.
 
 ## Notes
 - This is a standalone inference harness, not a ComfyUI integration.

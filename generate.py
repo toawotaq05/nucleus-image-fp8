@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import importlib.util
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -38,8 +40,7 @@ from accelerate import dispatch_model, infer_auto_device_map
 from diffusers import NucleusMoEImagePipeline
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Standalone Nucleus Image FP8 inference runner")
+def add_generation_args(parser: argparse.ArgumentParser, *, require_prompt: bool = True) -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         default=str(DEFAULT_MODEL_DIR),
@@ -50,15 +51,21 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_BASE_MODEL_DIR if DEFAULT_BASE_MODEL_DIR.exists() else "NucleusAI/Nucleus-Image"),
         help="Base pipeline repo id or local directory with VAE, scheduler, text encoder, and processor",
     )
-    parser.add_argument("--prompt", required=True, help="Prompt text")
+    parser.add_argument("--prompt", required=require_prompt, help="Prompt text")
     parser.add_argument("--negative", default=None, help="Negative prompt")
     parser.add_argument("--output", default=None, help="Output image path. Defaults to an auto-named PNG in outputs/")
     parser.add_argument("--name", default=None, help="Optional output basename without extension")
+    parser.add_argument("--count", type=int, default=1, help="Number of images to generate in one run")
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--steps", type=int, default=28)
     parser.add_argument("--guidance", type=float, default=4.0)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=42, help="Base seed. Combined with --count unless --randomize-seeds is used")
+    parser.add_argument(
+        "--randomize-seeds",
+        action="store_true",
+        help="Ignore --seed and pick fresh random seeds for this run",
+    )
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     parser.add_argument("--max-sequence-length", type=int, default=1024)
     parser.add_argument("--return-index", type=int, default=-8)
@@ -87,6 +94,16 @@ def parse_args() -> argparse.Namespace:
         help="Keep the text encoder on its device after prompt encoding instead of moving it back to CPU",
     )
     parser.add_argument("--local-files-only", action="store_true", help="Avoid network access during base model load")
+    return parser
+
+
+def build_arg_parser(*, require_prompt: bool = True) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Standalone Nucleus Image FP8 inference runner")
+    return add_generation_args(parser, require_prompt=require_prompt)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = build_arg_parser(require_prompt=True)
     return parser.parse_args()
 
 
@@ -123,6 +140,29 @@ def resolve_output_path(args: argparse.Namespace) -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     base = args.name.strip() if args.name else slugify_prompt(args.prompt)
     return (DEFAULT_OUTPUT_DIR / f"{stamp}-{base}.png").resolve()
+
+
+def resolve_output_paths(args: argparse.Namespace) -> list[Path]:
+    first_path = resolve_output_path(args)
+    if args.count == 1:
+        return [first_path]
+
+    suffix = first_path.suffix or ".png"
+    stem = first_path.stem
+    return [
+        first_path.with_name(f"{stem}-{index + 1:03d}{suffix}")
+        for index in range(args.count)
+    ]
+
+
+def resolve_seeds(args: argparse.Namespace) -> list[int]:
+    if args.count < 1:
+        raise ValueError("--count must be at least 1")
+
+    if args.randomize_seeds:
+        return [random.SystemRandom().randrange(0, 2**31) for _ in range(args.count)]
+
+    return [args.seed + index for index in range(args.count)]
 
 
 def load_patch_module(model_dir: Path):
@@ -283,16 +323,16 @@ def build_generator(device_str: str, seed: int) -> torch.Generator:
     return torch.Generator(gen_device).manual_seed(seed)
 
 
-def main() -> None:
-    args = parse_args()
-    model_dir = Path(args.model).resolve()
-    output_path = resolve_output_path(args)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
+def validate_model_dir(model_dir: Path) -> None:
     if not model_dir.exists():
         raise FileNotFoundError(f"Model directory does not exist: {model_dir}")
     if not (model_dir / "config.json").exists():
         raise FileNotFoundError(f"Missing config.json in {model_dir}")
+
+
+def load_pipeline(args: argparse.Namespace) -> tuple[NucleusMoEImagePipeline, str]:
+    model_dir = Path(args.model).resolve()
+    validate_model_dir(model_dir)
 
     print(f"torch={torch.__version__}")
     print(f"cuda_available={torch.cuda.is_available()}")
@@ -338,6 +378,17 @@ def main() -> None:
     print(f"Transformer primary device: {primary_module_device(pipe.transformer)}")
     print(f"Text encoder device for embedding pass: {args.text_encoder_device}")
     print(f"VAE decode device: {vae_device}")
+    return pipe, execution_device
+
+
+def generate_images(
+    pipe: NucleusMoEImagePipeline,
+    execution_device: str,
+    args: argparse.Namespace,
+) -> list[Path]:
+    output_paths = resolve_output_paths(args)
+    seeds = resolve_seeds(args)
+    output_paths[0].parent.mkdir(parents=True, exist_ok=True)
 
     started = time.time()
     prompt_embeds, prompt_embeds_mask, negative_prompt_embeds, negative_prompt_embeds_mask = encode_prompts(pipe, args)
@@ -349,8 +400,6 @@ def main() -> None:
         negative_prompt_embeds_mask,
     )
     print(f"Prompt encoding finished in {time.time() - started:.1f}s")
-
-    generator = build_generator(execution_device, args.seed)
 
     call_kwargs = {
         "prompt": None,
@@ -365,16 +414,43 @@ def main() -> None:
         "num_inference_steps": args.steps,
         "max_sequence_length": args.max_sequence_length,
         "return_index": args.return_index,
-        "generator": generator,
         "output_type": "pil",
     }
 
-    print("Running inference...")
-    started = time.time()
-    result = pipe(**call_kwargs)
-    image = result.images[0]
-    image.save(output_path)
-    print(f"Saved {output_path} in {time.time() - started:.1f}s")
+    if args.count == 1:
+        print(f"Running inference with seed {seeds[0]}...")
+    else:
+        print(f"Running inference for {args.count} images...")
+        print(f"Seeds: {', '.join(str(seed) for seed in seeds)}")
+
+    total_started = time.time()
+    for index, (seed, output_path) in enumerate(zip(seeds, output_paths), start=1):
+        started = time.time()
+        generator = build_generator(execution_device, seed)
+        result = pipe(**call_kwargs, generator=generator)
+        image = result.images[0]
+        image.save(output_path)
+        if args.count == 1:
+            print(f"Saved {output_path} in {time.time() - started:.1f}s")
+        else:
+            print(f"[{index}/{args.count}] seed={seed} saved {output_path} in {time.time() - started:.1f}s")
+
+    if args.count > 1:
+        print(f"Finished {args.count} images in {time.time() - total_started:.1f}s")
+    return output_paths
+
+
+def clone_args(args: argparse.Namespace, **overrides) -> argparse.Namespace:
+    next_args = copy.copy(args)
+    for key, value in overrides.items():
+        setattr(next_args, key, value)
+    return next_args
+
+
+def main() -> None:
+    args = parse_args()
+    pipe, execution_device = load_pipeline(args)
+    generate_images(pipe, execution_device, args)
 
 
 if __name__ == "__main__":
